@@ -1,0 +1,41 @@
+name: CDR Daily Update
+
+# Configuración del horario
+on:
+  schedule:
+    # 2 AM hora Bogotá = 7 AM UTC (Bogotá UTC-5)
+    - cron: '0 7 * * *'  # Corre a las 7:00 AM UTC = 2:00 AM Bogotá
+  # Permitir ejecución manual
+  workflow_dispatch:
+
+jobs:
+  update-cdr:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+      
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Ejecutar script de CDR
+        run: python scripts/cdr_merge.py
+        env:
+          # Credenciales desde Secrets
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+          API_USER: ${{ secrets.API_USER }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+      
+      - name: Verificar resultado
+        run: echo "✅ Proceso completado a las $(date)"
