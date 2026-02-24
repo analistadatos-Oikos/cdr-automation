@@ -1,0 +1,400 @@
+# ============================================================================
+# SCRIPT: CDR_LLAMADAS -> PARQUET EN OCI (CON VARIABLES DE ENTORNO)
+# ============================================================================
+
+import os
+import pandas as pd
+import json
+import tempfile
+import time
+from sqlalchemy import create_engine, text
+from oci.object_storage import ObjectStorageClient
+from tqdm import tqdm
+import numpy as np
+import sys
+
+print("=" * 80)
+print("🚀 INICIO DEL PROCESO: CDR_LLAMADAS -> NUEVO PARQUET")
+print("=" * 80)
+
+# ============================================================================
+# 📥 CONFIGURACIÓN CON VARIABLES DE ENTORNO
+# ============================================================================
+
+# --- Credenciales Oracle (desde secrets) ---
+ORACLE_USER = os.environ.get('ORACLE_USER')
+ORACLE_PASSWORD = os.environ.get('ORACLE_PASSWORD')
+ORACLE_DSN = os.environ.get('ORACLE_DSN')
+
+# --- Credenciales OCI (desde secrets) ---
+USER_OCID = os.environ.get('OCI_USER_OCID')
+TENANCY_OCID = os.environ.get('OCI_TENANCY_OCID')
+KEY_FINGERPRINT = os.environ.get('OCI_KEY_FINGERPRINT')
+PRIVATE_KEY_CONTENT = os.environ.get('OCI_PRIVATE_KEY')
+
+# --- Configuración del bucket ---
+BUCKET_NAME = "mis-parquets-oikos"
+REGION = "us-ashburn-1"
+NAMESPACE = "idazkw2d7ca6"
+
+# --- Configuración de la tabla ---
+TABLA_CDR = "CDR_LLAMADAS"
+ARCHIVO_NUEVO = "CDR_Llamadas_Actualizado_v2.parquet"
+NOMBRE_AMIGABLE = "CDR LLAMADAS (Nuevo)"
+
+# Verificar que todas las credenciales están presentes
+credenciales_faltantes = []
+if not ORACLE_USER: credenciales_faltantes.append("ORACLE_USER")
+if not ORACLE_PASSWORD: credenciales_faltantes.append("ORACLE_PASSWORD")
+if not ORACLE_DSN: credenciales_faltantes.append("ORACLE_DSN")
+if not USER_OCID: credenciales_faltantes.append("OCI_USER_OCID")
+if not TENANCY_OCID: credenciales_faltantes.append("OCI_TENANCY_OCID")
+if not KEY_FINGERPRINT: credenciales_faltantes.append("OCI_KEY_FINGERPRINT")
+if not PRIVATE_KEY_CONTENT: credenciales_faltantes.append("OCI_PRIVATE_KEY")
+
+if credenciales_faltantes:
+    print(f"❌ Error: Faltan las siguientes credenciales: {', '.join(credenciales_faltantes)}")
+    sys.exit(1)
+
+# ============================================================================
+# 🔧 CONFIGURACIÓN OCI SDK
+# ============================================================================
+
+KEY_FILE_PATH = "/tmp/oci_key_cdr.pem"
+OBJECT_STORAGE_CLIENT = None
+
+try:
+    # Escribir la clave privada en un archivo temporal
+    with open(KEY_FILE_PATH, 'w') as f:
+        f.write(PRIVATE_KEY_CONTENT.strip())
+
+    OCI_CONFIG = {
+        "user": USER_OCID,
+        "fingerprint": KEY_FINGERPRINT,
+        "key_file": KEY_FILE_PATH,
+        "tenancy": TENANCY_OCID,
+        "region": REGION
+    }
+
+    OBJECT_STORAGE_CLIENT = ObjectStorageClient(OCI_CONFIG)
+    print("✅ Configuración OCI SDK exitosa.\n")
+
+except Exception as e:
+    print(f"❌ Error al configurar OCI SDK: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# ============================================================================
+# 📋 FUNCIÓN PARA DIAGNOSTICAR COLUMNAS
+# ============================================================================
+
+def diagnosticar_columnas(df):
+    """Muestra las columnas disponibles en el DataFrame"""
+    print(f"\n🔍 Columnas disponibles en el DataFrame:")
+    columnas_importantes = ['CALLLATE', 'CALLHOUR', 'CLID', 'SRC', 'DST', 'UNIQUEID']
+    
+    for col in columnas_importantes:
+        if col in df.columns:
+            print(f"   ✅ '{col}'")
+        else:
+            # Buscar variantes
+            encontrada = False
+            for col_real in df.columns:
+                if col.lower() in col_real.lower():
+                    print(f"   ⚠️ '{col}' → Encontrada como '{col_real}'")
+                    encontrada = True
+                    break
+            if not encontrada:
+                print(f"   ❌ '{col}' no encontrada")
+    
+    return df.columns.tolist()
+
+# ============================================================================
+# 🧹 FUNCIÓN DE LIMPIEZA PARA CDR
+# ============================================================================
+
+def limpiar_cdr(df):
+    """Limpieza específica para CDR"""
+    if df.empty:
+        return df
+    
+    registros_iniciales = len(df)
+    print(f"\n📊 Registros iniciales: {registros_iniciales:,}")
+    
+    # Identificar columnas reales (con mayúsculas como vienen de Oracle)
+    columnas_df = df.columns.tolist()
+    
+    # Mapeo de posibles nombres
+    mapeo = {}
+    for col in columnas_df:
+        col_upper = col.upper()
+        if col_upper == 'CALLLATE':
+            mapeo[col] = 'CALLLATE'
+        elif col_upper == 'CALLHOUR':
+            mapeo[col] = 'CALLHOUR'
+        elif col_upper == 'CLID':
+            mapeo[col] = 'CLID'
+        elif col_upper == 'SRC':
+            mapeo[col] = 'SRC'
+        elif col_upper == 'DST':
+            mapeo[col] = 'DST'
+        elif col_upper == 'DCONTEXT':
+            mapeo[col] = 'DCONTEXT'
+        elif col_upper == 'CHANNEL':
+            mapeo[col] = 'CHANNEL'
+        elif col_upper == 'DSTCHANNEL':
+            mapeo[col] = 'DSTCHANNEL'
+        elif col_upper == 'LASTAPP':
+            mapeo[col] = 'LASTAPP'
+        elif col_upper == 'DURATION':
+            mapeo[col] = 'DURATION'
+        elif col_upper == 'DISPOSITION':
+            mapeo[col] = 'DISPOSITION'
+        elif col_upper == 'UNIQUEID':
+            mapeo[col] = 'UNIQUEID'
+        elif col_upper == 'CALLTYPE':
+            mapeo[col] = 'CALLTYPE'
+    
+    # Aplicar mapeo si hay columnas que renombrar
+    if mapeo:
+        df = df.rename(columns=mapeo)
+        print(f"   🔄 Columnas renombradas: {len(mapeo)}")
+    
+    # Limpiar cada columna según su tipo
+    if 'CLID' in df.columns:
+        df['CLID'] = df['CLID'].fillna('').astype(str)
+    if 'SRC' in df.columns:
+        df['SRC'] = df['SRC'].fillna('').astype(str)
+    if 'DST' in df.columns:
+        df['DST'] = df['DST'].fillna('').astype(str)
+    if 'DCONTEXT' in df.columns:
+        df['DCONTEXT'] = df['DCONTEXT'].fillna('').astype(str)
+    if 'CHANNEL' in df.columns:
+        df['CHANNEL'] = df['CHANNEL'].fillna('').astype(str)
+    if 'DSTCHANNEL' in df.columns:
+        df['DSTCHANNEL'] = df['DSTCHANNEL'].fillna('').astype(str)
+    if 'LASTAPP' in df.columns:
+        df['LASTAPP'] = df['LASTAPP'].fillna('').astype(str)
+    if 'DISPOSITION' in df.columns:
+        df['DISPOSITION'] = df['DISPOSITION'].fillna('DESCONOCIDO').astype(str)
+    if 'CALLTYPE' in df.columns:
+        df['CALLTYPE'] = df['CALLTYPE'].fillna('DESCONOCIDO').astype(str)
+    if 'DURATION' in df.columns:
+        df['DURATION'] = pd.to_numeric(df['DURATION'], errors='coerce').fillna(0).astype(int)
+    if 'CALLLATE' in df.columns:
+        df['CALLLATE'] = pd.to_datetime(df['CALLLATE'], errors='coerce')
+        df['CALLLATE'] = df['CALLLATE'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df['CALLLATE'] = df['CALLLATE'].fillna('1900-01-01 00:00:00')
+    if 'CALLHOUR' in df.columns:
+        df['CALLHOUR'] = df['CALLHOUR'].astype(str).str[:8]
+        df.loc[~df['CALLHOUR'].str.match(r'\d{2}:\d{2}:\d{2}', na=False), 'CALLHOUR'] = '00:00:00'
+    if 'UNIQUEID' in df.columns:
+        df['UNIQUEID'] = df['UNIQUEID'].astype(str)
+    
+    print(f"✅ Registros después de limpieza: {len(df):,}")
+    return df
+
+# ============================================================================
+# 🗑️ FUNCIÓN PARA LIMPIAR VERSIONES ANTIGUAS
+# ============================================================================
+
+def limpiar_versiones_antiguas(client, namespace, bucket_name, object_name):
+    """Elimina TODAS las versiones anteriores de un objeto"""
+    try:
+        versions = client.list_object_versions(
+            namespace_name=namespace,
+            bucket_name=bucket_name,
+            prefix=object_name
+        ).data.items
+
+        if not versions:
+            return
+
+        for version in versions:
+            try:
+                client.delete_object(
+                    namespace_name=namespace,
+                    bucket_name=bucket_name,
+                    object_name=version.name,
+                    version_id=version.version_id
+                )
+                print(f"   🗑️ Versión eliminada: {version.version_id}")
+            except:
+                pass
+    except Exception as e:
+        print(f"   ⚠️ Error limpiando versiones: {e}")
+
+# ============================================================================
+# ☁️ FUNCIÓN PARA SUBIR A OCI
+# ============================================================================
+
+def upload_to_oci_force_overwrite(client, namespace, bucket_name, object_name, file_path, pbar):
+    """Sube archivo a OCI con sobrescritura REAL"""
+    if not client:
+        return False
+
+    try:
+        print(f"\n   🧹 Limpiando versiones anteriores...")
+        limpiar_versiones_antiguas(client, namespace, bucket_name, object_name)
+
+        with open(file_path, 'rb') as f:
+            client.put_object(
+                namespace_name=namespace,
+                bucket_name=bucket_name,
+                object_name=object_name,
+                put_object_body=f
+            )
+
+        return True
+
+    except Exception as e:
+        print(f"\n❌ Error al subir: {e}")
+        return False
+
+# ============================================================================
+# 🎯 FUNCIÓN PRINCIPAL
+# ============================================================================
+
+def main():
+    inicio_total = time.time()
+    
+    if not OBJECT_STORAGE_CLIENT:
+        print("❌ No se puede continuar sin OCI.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"🎯 PROCESANDO: {NOMBRE_AMIGABLE}")
+    print(f"📁 Archivo destino: {ARCHIVO_NUEVO}")
+    print(f"{'='*60}\n")
+
+    try:
+        # 1. Conectar a Oracle
+        print("🔌 Conectando a Oracle...")
+        engine = create_engine(
+            f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}",
+            arraysize=5000,  # Optimizado para lectura masiva
+            max_identifier_length=128
+        )
+        
+        # Probar conexión
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1 FROM DUAL"))
+        print("✅ Conexión a Oracle establecida.")
+
+        # 2. Contar registros
+        with engine.connect() as conn:
+            result = conn.execute(text(f'SELECT COUNT(*) FROM "{TABLA_CDR}"'))
+            total_registros = result.scalar()
+            print(f"📊 Total en BD: {total_registros:,} registros")
+
+        # 3. Leer TODOS los datos
+        print(f"\n📚 Leyendo datos de {TABLA_CDR}...")
+        inicio_lectura = time.time()
+        
+        # Leer todo de una vez
+        df = pd.read_sql(f'SELECT * FROM "{TABLA_CDR}"', engine)
+        
+        tiempo_lectura = time.time() - inicio_lectura
+        registros_leidos = len(df)
+        
+        print(f"✅ Leídos {registros_leidos:,} registros en {tiempo_lectura:.2f} segundos")
+
+        # 4. Verificar integridad
+        if registros_leidos != total_registros:
+            print(f"⚠️ ALERTA: Leídos {registros_leidos:,} vs {total_registros:,} en BD")
+        else:
+            print(f"✅ Integridad verificada: 100% de los registros")
+
+        if df.empty:
+            print("❌ La tabla está vacía")
+            return
+
+        # 5. Diagnosticar columnas
+        diagnosticar_columnas(df)
+
+        # 6. Limpiar datos
+        print(f"\n🧹 Limpiando datos...")
+        df = limpiar_cdr(df)
+
+        # 7. Crear archivo temporal
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            ruta_temporal = tmp.name
+
+        # 8. Guardar como Parquet
+        print(f"\n💾 Guardando como Parquet...")
+        inicio_parquet = time.time()
+        
+        # Optimizaciones para Parquet
+        df.to_parquet(
+            ruta_temporal, 
+            index=False, 
+            engine='pyarrow', 
+            compression='snappy',
+            row_group_size=100000  # Optimizado para 300k+ registros
+        )
+        
+        tiempo_parquet = time.time() - inicio_parquet
+        tamaño_mb = os.path.getsize(ruta_temporal) / (1024 * 1024)
+        
+        print(f"✅ Archivo creado: {tamaño_mb:.2f} MB")
+        print(f"⏱️  Tiempo de compresión: {tiempo_parquet:.2f} segundos")
+
+        # 9. Subir a OCI con barra de progreso
+        print(f"\n☁️ Subiendo a OCI bucket '{BUCKET_NAME}'...")
+        
+        with tqdm(total=100, desc="Subiendo", unit="%", ncols=80) as pbar:
+            pbar.update(10)
+            
+            resultado = upload_to_oci_force_overwrite(
+                client=OBJECT_STORAGE_CLIENT,
+                namespace=NAMESPACE,
+                bucket_name=BUCKET_NAME,
+                object_name=ARCHIVO_NUEVO,
+                file_path=ruta_temporal,
+                pbar=pbar
+            )
+            
+            pbar.update(90)
+
+        if resultado:
+            print(f"\n✅ Archivo subido exitosamente!")
+            print(f"   📁 {ARCHIVO_NUEVO}")
+            print(f"   📦 {tamaño_mb:.2f} MB")
+            print(f"   📊 {len(df):,} registros")
+        else:
+            print(f"\n❌ Error al subir el archivo")
+
+        # 10. Limpiar archivo temporal
+        if os.path.exists(ruta_temporal):
+            os.remove(ruta_temporal)
+            print(f"\n🧹 Archivo temporal eliminado.")
+
+        # Tiempo total
+        tiempo_total = time.time() - inicio_total
+        minutos = int(tiempo_total // 60)
+        segundos = int(tiempo_total % 60)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ PROCESO COMPLETADO EXITOSAMENTE")
+        print(f"⏱️  Tiempo total: {minutos} minutos {segundos} segundos")
+        print(f"📁 Archivo: {ARCHIVO_NUEVO}")
+        print(f"{'='*60}")
+
+    except Exception as e:
+        print(f"\n❌ Error general: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    finally:
+        if os.path.exists(KEY_FILE_PATH):
+            os.remove(KEY_FILE_PATH)
+            print("🧹 Clave privada eliminada.")
+
+# ============================================================================
+# 🏃 EJECUTAR
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
