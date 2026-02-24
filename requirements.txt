@@ -8,3 +8,4 @@ urllib3
 colorama
 tqdm
 oci
+pyarrow
