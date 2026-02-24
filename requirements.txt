@@ -1,0 +1,9 @@
+requests
+pandas
+sqlalchemy
+oracledb
+numpy
+pytz
+urllib3
+colorama
+tqdm
