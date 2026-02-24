@@ -7,3 +7,4 @@ pytz
 urllib3
 colorama
 tqdm
+oci
