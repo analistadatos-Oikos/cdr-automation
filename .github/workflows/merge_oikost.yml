@@ -1,0 +1,34 @@
+name: Merge OIKOST Crudo Diario
+
+on:
+  schedule:
+    # 2:30 AM Bogotá = 7:30 UTC (Bogotá UTC-5)
+    - cron: '30 7 * * *'
+  workflow_dispatch:  # Permite ejecución manual
+
+jobs:
+  merge-oikost:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+      
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Ejecutar merge incremental OIKOST
+        run: python scripts/merge_oikost_crudo.py
+        env:
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+          OIKOST_TOKEN: ${{ secrets.OIKOST_TOKEN }}
